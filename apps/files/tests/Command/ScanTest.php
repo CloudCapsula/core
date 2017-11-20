@@ -1,6 +1,7 @@
 <?php
 /**
  * @author Sujith Haridasan <sharidasan@owncloud.com>
+ * @author Vincent Petry <pvince81@owncloud.com>
  *
  * @copyright Copyright (c) 2018, ownCloud GmbH
  * @license AGPL-3.0
@@ -25,6 +26,13 @@ use OCA\Files\Command\Scan;
 use Symfony\Component\Console\Tester\CommandTester;
 use Test\TestCase;
 use Test\Traits\UserTrait;
+use OCP\IUserManager;
+use OCP\IConfig;
+use OCP\Files\IMimeTypeLoader;
+use OCP\Lock\ILockingProvider;
+use OCP\IUser;
+use OCP\IDBConnection;
+use OCP\IGroupManager;
 
 /**
  * Class ScanTest
@@ -33,31 +41,103 @@ use Test\Traits\UserTrait;
  * @package OCA\Files\Tests\Command
  */
 class ScanTest extends TestCase {
-	use UserTrait;
+	/**
+	 * @var IDBConnection
+	 */
+	private $connection;
 
-	/** @var  CommandTester */
+	/**
+	 * @var IUserManager
+	 */
+	private $userManager;
+
+	/**
+	 * @var IGroupManager
+	 */
+	private $groupManager;
+
+	/**
+	 * @var ILockingProvider | \PHPUnit_Framework_MockObject_MockObject
+	 */
+	private $lockingProvider;
+
+	/**
+	 * @var IMimeTypeLoader | \PHPUnit_Framework_MockObject_MockObject
+	 */
+	private $mimeTypeLoader;
+
+	/**
+	 * @var IConfig | \PHPUnit_Framework_MockObject_MockObject
+	 */
+	private $config;
+
+	/**
+	 * @var IUser
+	 */
+	private $user1;
+
+	/**
+	 * @var IUser
+	 */
+	private $user2;
+
+	/**
+	 * @var CommandTester
+	 */
 	private $commandTester;
 
-	private $groupsCreated = [];
-	protected function setUp() {
-		parent::setUp();
-		$command = new Scan(
-			\OC::$server->getUserManager(), \OC::$server->getGroupManager(),
-			\OC::$server->getLockingProvider(), \OC::$server->getMimeTypeLoader(),
-			\OC::$server->getConfig());
+	/**
+	 * @var string[]
+	 */
+	private $usersCreated = [];
 
+	/**
+	 * @var string[]
+	 */
+	private $groupsCreated = [];
+
+	protected function setUp() {
+		if (getenv('RUN_OBJECTSTORE_TESTS')) {
+			$this->markTestSkipped('not testing scanner as it does not make sense for primary object store');
+		}
+		parent::setUp();
+
+		$this->connection = \OC::$server->getDatabaseConnection();
+		$this->userManager = \OC::$server->getUserManager();
+		$this->groupManager = \OC::$server->getGroupManager();
+		$this->lockingProvider = $this->createMock(ILockingProvider::class);
+		$this->mimeTypeLoader = $this->createMock(IMimeTypeLoader::class);
+		$this->config = $this->createMock(IConfig::class);
+
+		$command = new Scan(
+			$this->userManager,
+			$this->groupManager,
+			$this->lockingProvider,
+			$this->mimeTypeLoader,
+			$this->config
+		);
 		$this->commandTester = new CommandTester($command);
-		$user1 = $this->createUser('user1');
-		$this->createUser('user2');
-		\OC::$server->getGroupManager()->createGroup('group1');
-		\OC::$server->getGroupManager()->get('group1')->addUser($user1);
+
+		$this->user1 = $this->userManager->createUser('user1', 'user1');
+		$this->user2 = $this->userManager->createUser('user2', 'user2');
+		$this->usersCreated[] = 'user1';
+		$this->usersCreated[] = 'user2';
+
+		$this->groupManager->createGroup('group1');
+		$this->groupManager->get('group1')->addUser($this->user1);
 		$this->groupsCreated[] = 'group1';
+
+		$this->dataDir = \OC::$server->getConfig()->getSystemValue('datadirectory', \OC::$SERVERROOT . '/data-autotest');
+
+		@mkdir($this->dataDir . '/' . $this->user1->getUID() . '/files/toscan', 0777, true);
 	}
 
 	protected function tearDown() {
-		$this->tearDownUserTrait();
+		foreach ($this->usersCreated as $user) {
+			$this->userManager->get($user)->delete();
+		}
 		foreach ($this->groupsCreated as $group) {
-			\OC::$server->getGroupManager()->get($group)->delete();
+			$this->groupManager->get($group)->delete();
 		}
 		parent::tearDown();
 	}
@@ -95,9 +175,10 @@ class ScanTest extends TestCase {
 		//First we populate the users
 		$user = 'user';
 		$numberOfUsersInGroup = 210;
-		for($i = 2; $i <= 210; $i++) {
-			$userObj = $this->createUser($user.$i);
-			\OC::$server->getGroupManager()->get('group1')->addUser($userObj);
+		for($i = 3; $i <= 210; $i++) {
+			$userObj = $this->userManager->createUser($user.$i, $user.$i);
+			$this->usersCreated[] = $user.$i;
+			$this->groupManager->get('group1')->addUser($userObj);
 		}
 
 		$this->commandTester->execute($input);
@@ -123,24 +204,25 @@ class ScanTest extends TestCase {
 		$groups = explode(',', $input['--groups']);
 		$user = "user";
 		$userObj = [];
-		for ($i = 1; $i <= (10 * count($groups)); $i++ ) {
-			$userObj[] = $this->createUser($user.$i);
+		for ($i = 3; $i <= (10 * count($groups)); $i++ ) {
+			$userObj[] = $this->userManager->createUser($user.$i, $user.$i);
+			$this->usersCreated[] = $user.$i;
 		}
 
 		$userCount = 1;
 		foreach ($groups as $group) {
-			if (\OC::$server->getGroupManager()->groupExists($group) === false) {
-				\OC::$server->getGroupManager()->createGroup($group);
+			if ($this->groupManager->groupExists($group) === false) {
+				$this->groupManager->createGroup($group);
 				$this->groupsCreated[] = $group;
 				for ($i = $userCount; $i <= ($userCount + 9); $i++) {
 					$j = $i - 1;
-					\OC::$server->getGroupManager()->get($group)->addUser($userObj[$j]);
+					$this->groupManager->get($group)->addUser($userObj[$j]);
 				}
 				$userCount = $i;
 			} else {
 				for ($i = $userCount; $i <= ($userCount + 9); $i++) {
 					$j = $i - 1;
-					\OC::$server->getGroupManager()->get($group)->addUser($userObj[$j]);
+					$this->groupManager->get($group)->addUser($userObj[$j]);
 				}
 				$userCount = $i;
 			}
@@ -159,4 +241,159 @@ class ScanTest extends TestCase {
 			$this->assertContains('Starting scan for user 10 out of 10 (user30)', $output);
 		}
 	}
+
+	public function testScanAll() {
+		@mkdir($this->dataDir . '/' . $this->user2->getUID() . '/files/toscan2', 0777, true);
+
+		$input = [
+			'--all' => true,
+		];
+
+		$result = $this->commandTester->execute($input);
+		$this->assertEquals(0, $result);
+
+		// new entry was found for both users
+		$storageId = $this->getStorageId('home::' . $this->user1->getUID());
+		$entry = $this->getFileCacheEntry($storageId, 'files/toscan');
+		$this->assertEquals('files/toscan', $entry['path']);
+
+		$storageId2 = $this->getStorageId('home::' . $this->user2->getUID());
+		$entry2 = $this->getFileCacheEntry($storageId2, 'files/toscan2');
+		$this->assertEquals('files/toscan2', $entry2['path']);
+
+	}
+
+	public function testScanOne() {
+		@mkdir($this->dataDir . '/' . $this->user2->getUID() . '/files/toscan2', 0777, true);
+
+		$input = [
+			'user_id' => [$this->user2->getUID()],
+		];
+
+		$result = $this->commandTester->execute($input);
+		$this->assertEquals(0, $result);
+
+		// new entry was found only for user2
+		$storageId = $this->getStorageId('home::' . $this->user1->getUID());
+		$this->assertFalse($this->getFileCacheEntry($storageId, 'files/toscan'));
+
+		$storageId2 = $this->getStorageId('home::' . $this->user2->getUID());
+		$entry2 = $this->getFileCacheEntry($storageId2, 'files/toscan2');
+		$this->assertEquals('files/toscan2', $entry2['path']);
+	}
+
+	public function maintenanceConfigsProvider() {
+		return [
+			[
+				[
+					['singleuser', false, true],
+					['maintenance', false, false],
+				],
+			],
+			[
+				[
+					['singleuser', false, false],
+					['maintenance', false, true],
+				],
+			],
+		];
+	}
+
+	/**
+	 * Test running repair all
+	 *
+	 * @dataProvider maintenanceConfigsProvider
+	 */
+	public function testScanRepairAllInMaintenanceMode($config) {
+		$this->config->method('getSystemValue')
+			->will($this->returnValueMap($config));
+
+		$input = [
+			'--all' => true,
+			'--repair' => true,
+		];
+
+		$result = $this->commandTester->execute($input);
+
+		// TODO: find a way to test that repair code has run
+
+		// new entry was found
+		$storageId = $this->getStorageId('home::' . $this->user1->getUID());
+		$entry = $this->getFileCacheEntry($storageId, 'files/toscan');
+		$this->assertEquals('files/toscan', $entry['path']);
+
+		$this->assertEquals(0, $result);
+	}
+
+	/**
+	 * Returns storage numeric id for the given string id
+	 *
+	 * @param string $storageStringId
+	 * @return int|null numeric id
+	 */
+	private function getStorageId($storageStringId) {
+		$qb = $this->connection->getQueryBuilder();
+		$qb->select('numeric_id')
+			->from('storages')
+			->where($qb->expr()->eq('id', $qb->createNamedParameter($storageStringId)));
+		$results = $qb->execute();
+		$result = $results->fetch();
+		$results->closeCursor();
+
+		if ($result) {
+			return (int)$result['numeric_id'];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Returns file cache DB entry for given path
+	 *
+	 * @param int $storageId storage numeric id
+	 * @param string $path path
+	 * @return array file cache DB entry
+	 */
+	private function getFileCacheEntry($storageId, $path) {
+		$qb = $this->connection->getQueryBuilder();
+		$qb->select('*')
+			->from('filecache')
+			->where($qb->expr()->eq('storage', $qb->createNamedParameter($storageId)))
+			->andWhere($qb->expr()->eq('path_hash', $qb->createNamedParameter(md5($path))));
+		$results = $qb->execute();
+		$result = $results->fetch();
+		$results->closeCursor();
+
+		return $result;
+	}
+
+	/**
+	 * Test repair all error message when not in maintenance mode
+	 *
+	 */
+	public function testScanRepairAllNoSingleUserMode() {
+		$this->config->method('getSystemValue')
+			->will($this->returnValueMap([
+				['singleuser', false, false],
+				['maintenance', false, false],
+			]));
+
+		$input = [
+			'--all' => true,
+			'--repair' => true,
+		];
+
+		$result = $this->commandTester->execute($input);
+
+		$this->assertEquals(1, $result);
+
+		$output = $this->commandTester->getDisplay();
+
+		$this->assertContains('Please switch to single user mode', $output);
+		$this->assertContains('specify a user to repair', $output);
+
+		$storageId = $this->getStorageId('home::' . $this->user1->getUID());
+		$this->assertFalse($this->getFileCacheEntry($storageId, 'files/toscan'));
+	}
 }
+
